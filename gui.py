@@ -78,10 +78,10 @@ class Paint:
             # Make sure x and y have a value
             if self.x_pos is not None and self.y_pos is not None:
                 # event.widget.create_line(self.x_pos, self.y_pos, event.x, event.y)
-                # self.paint_queue.put((event, self.x_pos, self.y_pos))  #
+                # self.painting_queue.put((event, self.x_pos, self.y_pos))  #
 
                 points = line(self.x_pos, self.y_pos, event.x, event.y)
-                # self.paint_queue.put(points)
+                # self.painting_queue.put(points)
                 self.main_queue.put(InnerDrawingInformationEvent(NTP_timer.get_timestamp(), points, color))
 
             self.x_pos = event.x
@@ -150,8 +150,8 @@ class Paint:
     def run(self):
         # while self.running:
         #     self.make_mouse_events()
-        #     while not self.paint_queue.empty():
-        #         points = self.paint_queue.get()
+        #     while not self.painting_queue.empty():
+        #         points = self.painting_queue.get()
         #         for point in points:
         #             self.drawing_area.create_rectangle((point[0], point[1]) * 2, outline='black')
         while self.running:
@@ -172,6 +172,14 @@ class Paint:
                         self.boardState.set("Board possessed")
                     elif e.type == PaintQueueEvent.CONNECTION_FAILED:
                         tkinter.messagebox.showinfo("Bad host address", "At given address there is no host.")
+                    elif e.type == PaintQueueEvent.BAD_BOARD_SIZE:
+                        pass
+                        # Because of canvas behaviour must omit this one
+                        # tkinter.messagebox.showinfo("Error",
+                        #                             "Board initialized with bad size!\nThe program will not stop"
+                        #                             " running but it is advisably for you to restart it with proper"
+                        #                             " board size.")
+                        ## return
                     else:
                         raise Exception('Wrong event type in painting queue.')
                 else:

@@ -1,6 +1,6 @@
 import NTP_timer
 from NewClientListener import *
-from NewPredecessorListener import *
+from NewPreviousHopListener import *
 from gui import *
 from Model import *
 
@@ -19,10 +19,10 @@ if __name__ == "__main__":
     new_client_listener = NewClientListener(main_queue)
     new_client_listener.run()
 
-    new_predecessor_listener = NewPredecessorListener(main_queue)
-    new_predecessor_listener.run()
+    new_previous_hop_listener = NewPreviousHopListener(main_queue)
+    new_previous_hop_listener.run()
 
-    model = Model(main_queue, painter_queue, new_client_listener, new_predecessor_listener)
+    model = Model(main_queue, painter_queue, new_client_listener, new_previous_hop_listener)
     model.run()
 
     gui = Paint(main_queue, painter_queue, new_client_listener)
@@ -30,5 +30,5 @@ if __name__ == "__main__":
 
     model.stop()
     new_client_listener.stop()
-    new_predecessor_listener.stop()
+    new_previous_hop_listener.stop()
     NTP_timer.NTP_timer.cancel()

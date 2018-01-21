@@ -3,12 +3,12 @@ import logging
 import threading
 from Event import *
 from utils import *
-from PredecessorListener import *
+from PreviousHopListener import *
 
 logger = logging.getLogger(__name__)
 
 
-class NewPredecessorListener:
+class NewPreviousHopListener:
     def __init__(self, main_queue, port=0):
         self.socket = self.create_new_socket(port)
         self.main_queue = main_queue
@@ -23,16 +23,16 @@ class NewPredecessorListener:
         return sock
 
     def listen_to_clients(self):
-        logger.info('Start listening to new predecessor on port {}'.format(self.socket.getsockname()[1]))
+        logger.info('Start listening to new previous_hop on port {}'.format(self.socket.getsockname()[1]))
         while self.running:
             try:
                 connection, addr = self.socket.accept()
-                logger.info('New Predecessor: {}:{}'.format(addr[0], addr[1]))
-                self.main_queue.put(InnerNewPredecessorRequestEvent(connection, addr))
+                logger.info('New Previous Hop: {}:{}'.format(addr[0], addr[1]))
+                self.main_queue.put(InnerNewPreviousHopRequestEvent(connection, addr))
 
             except OSError as e:
                 if self.running:
-                    logger.error('New Predecessor Listener failed to accept, {}'.format(type(e)))
+                    logger.error('New Previous Hop Listener failed to accept, {}'.format(type(e)))
                 else:
                     pass
 
@@ -42,7 +42,7 @@ class NewPredecessorListener:
         self.thread.start()
 
     def stop(self):
-        logger.info('Stop listening to new predecessor')
+        logger.info('Stop listening to new previous_hop')
         self.running = False
         self.socket.close()
         self.thread.join()

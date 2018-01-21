@@ -8,18 +8,18 @@ import json
 logger = logging.getLogger(__name__)
 
 
-class PredecessorListener:
-    def __init__(self, main_queue, connection, predecessor_address):
+class PreviousHopListener:
+    def __init__(self, main_queue, connection, previous_hop_address):
         self.main_queue = main_queue
         self.conn = connection
-        self.predecessor_address = predecessor_address
+        self.previous_hop_address = previous_hop_address
         self.running = True
         self.thread = None
 
     def listen_to_clients(self):
         global message
-        logger.info('P. Start thread to sending messages to {}:{}'.format(self.predecessor_address[0],
-                                                                          self.predecessor_address[1]))
+        logger.info('P. Start thread to listening messages from {}:{}'.format(self.previous_hop_address[0],
+                                                                          self.previous_hop_address[1]))
         while self.running:
             try:
                 message_size = b''
@@ -39,15 +39,21 @@ class PredecessorListener:
                 parsed_message = json.loads(message.decode('utf-8'))
                 self.handle_message(parsed_message)
             except Exception as ex:
-                print(message)
-                print(ex)
                 if message == b'':
-
-                    # Only case when we have a succesfull read of 0 bytes is when other socket shutdowns normally
+                    # Check if connection ended cleanly
                     return
-                logger.error(str(message))
+                else:
+                    # Else try to parse and pass message
+                    try:
+                        message = json.loads(message.decode('utf-8'))
+                        self.handle_message(message)
+                    except Exception:
+                        pass
                 logger.error(ex)
-                raise ex
+                self.running = False
+                # self.stop()
+        logger.info('Stop thread to listening messages from previous hop')
+        self.conn.close()
 
     def handle_message(self, parsed_message):
         message_type = EventType(parsed_message['type'])
@@ -67,8 +73,8 @@ class PredecessorListener:
             self.main_queue.put(LeavingCriticalSectionEvent(data['timestamp'], data['client_uuid']))
         elif message_type == EventType.TOKEN_RECEIVED_QUESTION:
             self.main_queue.put(TokenReceivedQuestionEvent(data['token']))
-        elif message_type == EventType.DUMMY_MESSAGE:
-            self.main_queue.put(DummyMessageEvent(data['uuid']))
+        elif message_type == EventType.CONTROL_PACKAGE:
+            self.main_queue.put(ControlPackageEvent(data['uuid']))
         else:
             logger.error(parsed_message)
             raise Exception("Not implemented yet")
@@ -79,7 +85,7 @@ class PredecessorListener:
         self.thread.start()
 
     def stop(self):
-        logger.info('Stop thread to sending messages to next_hop')
+        logger.info('Stop thread to listening messages from previous hop')
         self.running = False
         self.conn.close()
         self.thread.join()

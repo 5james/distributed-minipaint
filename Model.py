@@ -1,41 +1,39 @@
 from gui import PAINT_HEIGHT, PAINT_WIDTH
 import queue
 from NewClientListener import *
-from NewPredecessorListener import *
+from NewPreviousHopListener import *
 from MessageSender import *
-from PredecessorListener import *
+from PreviousHopListener import *
 import uuid
 import NTP_timer
-from DummyMessageSender import *
-from criticalsectionleaver import *
+from ControlPackageSender import *
 
 logger = logging.getLogger(__name__)
+
+_SECONDS_IN_CRITICAL_SECTION = 5.0
 
 
 class Model:
     def __init__(self, main_queue, paint_queue, new_client_listener: NewClientListener,
-                 new_predecessor_listener: NewPredecessorListener):
+                 new_previous_hop_listener: NewPreviousHopListener):
         self.running = True
         self.thread = None
 
         self.main_queue = main_queue
-        self.paint_queue = paint_queue
+        self.painting_queue = paint_queue
         # self.time_offset = time_offset
 
         self.sending_queue = None
         self.message_sender = None
 
         self.new_clients_listener = new_client_listener
-        self.new_predecessors_listener = new_predecessor_listener
+        self.new_previous_hop_listener = new_previous_hop_listener
 
-        self.predecessor_listener = None
+        self.previous_hop_listener = None
 
         self.next_hop_info = None
-        logger.info('New next hop0: {}'.format(self.next_hop_info))
         self.next_next_hop_info = None
-        logger.info('New next next hop7: {}'.format(self.next_next_hop_info))
-        self.predecessor = None
-        logger.info('Predecessor3: {}'.format(self.predecessor))
+        self.previous_hop = None
 
         self.critical_section = None
         self.want_to_enter_critical_section = False
@@ -54,6 +52,10 @@ class Model:
 
     def stop(self):
         logger.info('Stop model processing')
+        # if self.previous_hop_listener:
+        #     self.previous_hop_listener.stop()
+        # if self.message_sender:
+        #     self.message_sender.stop()
         self.running = False
         self.main_queue.put(InnerCloseMainQueue)
         self.thread.join()
@@ -62,13 +64,13 @@ class Model:
         logger.info('Start model processing')
         while self.running:
             (e) = self.main_queue.get()
-            # Handling inner events
+            # print(e)
             if isinstance(e, InnerNewConnectionEvent):
                 self.new_connection_to_node(e)
             elif isinstance(e, InnerNewClientRequestEvent):
                 self.handle_new_client_request(e)
-            elif isinstance(e, InnerNewPredecessorRequestEvent):
-                self.handle_new_predecessor_request(e)
+            elif isinstance(e, InnerNewPreviousHopRequestEvent):
+                self.handle_new_previous_hop_request(e)
             elif isinstance(e, InnerDrawingInformationEvent):
                 self.handle_inner_drawing_event(e)
             elif isinstance(e, DrawingInformationEvent):
@@ -85,10 +87,12 @@ class Model:
                 self.handle_leave_critical_section(e)
             elif isinstance(e, NewNextNextHop):
                 self.handle_new_next_next_hop(e)
-            elif isinstance(e, DummyMessageEvent):
-                self.handle_dummy_message_event(e)
+            elif isinstance(e, ControlPackageEvent):
+                self.handle_control_package_event(e)
             elif isinstance(e, InnerNextHopBroken):
                 self.handle_inner_next_hop_broken(e)
+            elif isinstance(e, InnerControlPackage):
+                self.handle_innder_control_package(e)
             elif isinstance(e, InnerWantToEnterCriticalSection):
                 self.handle_inner_want_to_enter_critical_section(e)
 
@@ -98,20 +102,20 @@ class Model:
         address = event.data['address']
         ip, port = address.split(':')
 
-        # Create new socket to connect to
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         logger.info('Connecting to node: {}:{}'.format(ip, port))
         try:
+            sock.settimeout(1)
             sock.connect((ip, int(port)))
 
-            # We send the client request containing our data so anothe rclient could connect as a predecessor
+            # We send the client request containing our data so anothe rclient could connect as a previous_hop
             new_client_request = NewClientRequestEvent(
-                (self.new_predecessors_listener.socket.getsockname()[0],
-                 self.new_predecessors_listener.socket.getsockname()[1]))
-            message = utils.event_to_message(new_client_request, )
+                (self.new_previous_hop_listener.socket.getsockname()[0],
+                 self.new_previous_hop_listener.socket.getsockname()[1]))
+            message = utils.event_to_message(new_client_request)
             message_size = (len(message)).to_bytes(8, byteorder='big')
-            sock.send(message_size)
-            sock.send(message)
+            sock.sendall(message_size)
+            sock.sendall(message)
 
             message_size = sock.recv(8)
             message_size = int.from_bytes(message_size, byteorder='big')
@@ -126,69 +130,58 @@ class Model:
             init_data = (json.loads(data.decode('utf-8')))['data']
 
             self.next_hop_info = init_data['next_hop']
-            logger.info('New next hop4: {}'.format(self.next_hop_info))
-            if not init_data['next_next_hop']:
-                # If there is no next_next_hop init data in the response we are the second client so we set
-                # next next hop as our address
-                self.next_next_hop_info = (utils.get_my_ip_address(), self.new_predecessors_listener)
-                logger.info('New next next hop8: {}'.format(self.next_next_hop_info))
-            else:
-                # If there are more thant two clients we set the value from the response
-                self.next_next_hop_info = init_data['next_next_hop']
-                logger.info('New next next hop9: {}'.format(self.next_next_hop_info))
+            logger.info('New next hop: {}'.format(self.next_hop_info))
 
-            # We initialize connection to our next hop and we start sending queue
+            # Check if we are connecting to group founder (only 1 node in ring)
+            if not init_data['next_next_hop']:
+                # If so next next hop is this node
+                self.next_next_hop_info = (self.new_previous_hop_listener.socket.getsockname()[0],
+                                           self.new_previous_hop_listener.socket.getsockname()[1])
+            else:
+                self.next_next_hop_info = init_data['next_next_hop']
+            logger.info('New next next hop: {}'.format(self.next_next_hop_info))
+
             ip, port = init_data['next_hop']
             sock2 = socket.create_connection((ip, int(port)))
             self.sending_queue = queue.Queue()
             self.message_sender = MessageSender(self.main_queue, self.sending_queue, sock2, (ip, port))
             self.message_sender.run()
-            # TODO initialize_board i dummy msg
             self.initialize_board(init_data['board_state'])
-            sock.shutdown(1)
+            self.initialize_critical_section(init_data['critical_section_state'])
+            sock.shutdown(socket.SHUT_WR)
             sock.close()
-
-        except Exception as e:
-            print('new connection', e)
-            sock.shutdown(1)
+        except (TimeoutError, ConnectionError, ConnectionRefusedError, ConnectionAbortedError,
+                ConnectionResetError, socket.timeout, socket.gaierror) as e:
+            logger.error('Error during connecting to socket')
+            print(type(e))
+            if self.painting_queue:
+                self.painting_queue.put(PaintConnectionFail())
+                return
+        except Exception:
+            logger.error('Error during connecting')
+            sock.shutdown(socket.SHUT_WR)
             sock.close()
-            if self.paint_queue:
-                self.paint_queue.put(PaintConnectionFail())
+            return
 
-
-
-        # We start a dummy message sender event which will create dummy messages to detect connection breaks
-        self.dummy_message_sender = DummyMessageSender(self.main_queue, self.uuid)
-        self.dummy_message_sender.run()
+        self.control_package_sender = ControlPackageSender(self.main_queue, self.uuid)
+        self.control_package_sender.run()
 
     def initialize_board(self, board_state):
         for counter in range(len(board_state)):
             x, y = board_state[counter]
-            self.paint_queue.put(PaintDrawing([(x, y)], 1))
+            self.painting_queue.put(PaintDrawing([(x, y)], 1))
             try:
                 self.board_state[x][y] = 1
             except IndexError:
                 return
 
+    def initialize_critical_section(self, critical_section):
+        if critical_section:
+            self.critical_section = critical_section
+            self.painting_queue.put(PaintBoardClosed())
+
     def handle_new_client_request(self, event: InnerNewClientRequestEvent):
-        group_founder = not self.next_hop_info
-        # When we detect a new client connecting we want to:
-        # 1.Send him the initial data over the connection we already established
-        # 2.Connect to him as a predecessor
-
-        # Gather the initial board state (only the coloured spots)
-        marked_spots = [(x, y) for x in range(len(self.board_state)) for y in range(len(self.board_state[x])) if
-                        self.board_state[x][y]]
-
-        # If we have next hop information we send it, if we do not have we are the first client so we send our
-        # information as the first hop information
-        if group_founder:
-            next_hop = (self.new_predecessors_listener.socket.getsockname()[0],
-                        self.new_predecessors_listener.socket.getsockname()[1])
-        else:
-            next_hop = self.next_hop_info
-
-        # Receive message which contains address of new client's new predecessor listener
+        # Firstly, we make sure, that the client sends us his address
         message_size = event.data['connection'].recv(8)
         message_size = int.from_bytes(message_size, byteorder='big')
         message = b''
@@ -197,228 +190,232 @@ class Model:
             if not packet:
                 return None
             message += packet
-        client_request = json.loads(message.decode('utf-8'))
+        try:
+            client_address = json.loads(message.decode('utf-8'))['data']['address']
+        except (json.decoder.JSONDecodeError, KeyError):
+            return
 
-        # If we are the first client next next hop is None
+        bCreateToken = not self.next_hop_info
+
+        # Start create init_data for client
+        # 1. next hop
+        if self.next_hop_info:
+            next_hop = self.next_hop_info
+        else:
+            next_hop = (self.new_previous_hop_listener.socket.getsockname()[0],
+                        self.new_previous_hop_listener.socket.getsockname()[1])
+        # 2. Get list of drawn_pixels
+        drawn_pixels = [(x, y) for x in range(len(self.board_state)) for y in range(len(self.board_state[x])) if
+                        self.board_state[x][y] == 1]
+
         response = NewClientResponseEvent(next_hop,
-                                          # self.new_predecessors_listener.socket.getsockname()[1],
+                                          # self.new_previous_hop_listener.socket.getsockname()[1],
                                           self.next_next_hop_info,
-                                          marked_spots,
+                                          drawn_pixels,
+                                          self.critical_section
                                           )
         message = utils.event_to_message(response)
         message_size = (len(message)).to_bytes(8, byteorder='big')
         event.data['connection'].send(message_size)
         event.data['connection'].send(message)
 
+        # Wait until the socket is closed, so we know that client node has initialized itself
         try:
             message = event.data['connection'].recv(8)
         except Exception as ex:
             if message == b'':
-                # Only case when we have a succesfull read of 0 bytes is when other socket shutdowns normally
+                # Socket closed successfully
                 pass
             else:
                 logger.error(ex)
-                # Client did not initializ correctly so we abort the process
+                # Client did not initialize correctly so we abort the process
                 return
 
-        # If we are not the first client we have to update our next next hop to our previous next hop
-        if not group_founder:
+        # After successfully initialized client we can connect to the previous hop listener
+        ip, port = client_address
+        # We connect to the new client previous hop listener
+        try:
+            connection = socket.create_connection((ip, port), 100)
+        except (TimeoutError, ConnectionError, ConnectionRefusedError, ConnectionAbortedError,
+                ConnectionResetError, socket.timeout):
+            # If we cannot connect, then we abort handling this request
+            logger.error('Error during connecting to new client')
+            return
+
+        # After all connections are established we are sure, that we can start changing our model for new client
+        # Update Next Next Hop
+        if self.next_hop_info:
+            # If we have next hop, make him next next hop, ...
             self.next_next_hop_info = self.next_hop_info
-            logger.info('New next next hop1: {}'.format(self.next_next_hop_info))
+            logger.info('New next next hop: {}'.format(self.next_next_hop_info))
         else:
-            # If we are the first client we update our next next hop info to self address
+            # ... if not then we are group founder and next next hop is us
             self.next_next_hop_info = (
-                self.new_predecessors_listener.socket.getsockname()[0],
-                self.new_predecessors_listener.socket.getsockname()[1])
-            logger.info('New next next hop2: {}'.format(self.next_next_hop_info))
+                self.new_previous_hop_listener.socket.getsockname()[0],
+                self.new_previous_hop_listener.socket.getsockname()[1])
+            logger.info('New next next hop: {}'.format(self.next_next_hop_info))
 
-        # Then we update our next hop info with the newest client request
-        self.next_hop_info = client_request['data']['address']
-        logger.info('New next hop5: {}'.format(self.next_hop_info))
+        # After this we can update our next hop as new client
+        self.next_hop_info = client_address
+        logger.info('New next hop: {}'.format(self.next_hop_info))
 
-        # # We stop current message sender if it exists
         # if self.message_sender:
         #     self.message_sender.stop()
 
-        ip, port = self.next_hop_info
-        # We establish a new connection and a new message sender
-        connection = socket.create_connection((ip, port), 100)
-        self.sending_queue = queue.Queue(maxsize=0)
+        # create message sender and create token if necessary
+        self.sending_queue = queue.Queue()
         self.message_sender = MessageSender(self.main_queue, self.sending_queue, connection, (ip, port))
         self.message_sender.run()
-        # TODO TOKEN
-        if group_founder and self.last_token != None:
-            # If we are the first client we start passing of the token
+        if bCreateToken and self.last_token is not None:
             self.sending_queue.put(TokenPassEvent(self.last_token))
 
-    def handle_new_predecessor_request(self, event: InnerNewPredecessorRequestEvent):
-        # The moment we have a new predecessor this means that the client before our predecessor
-        # has a new next next hop address (which is our address) and our predecessor has new next next hop (which is
-        # our next hop)
+    def handle_new_previous_hop_request(self, event: InnerNewPreviousHopRequestEvent):
+        self.previous_hop = event.data['address']
+        logger.info('previous hop: {}'.format(self.previous_hop))
 
-        self.predecessor = event.data['address']
-        logger.info('Predecessor1: {}'.format(self.predecessor))
         connection = event.data['connection']
-        if self.predecessor_listener:
-            self.predecessor_listener.stop()
-        self.predecessor_listener = PredecessorListener(self.main_queue, connection, self.predecessor)
-        self.predecessor_listener.run()
+        if self.previous_hop_listener:
+            self.previous_hop_listener.stop()
+        self.previous_hop_listener = PreviousHopListener(self.main_queue, connection, self.previous_hop)
+        self.previous_hop_listener.run()
 
-        self_address = (
-            self.new_predecessors_listener.socket.getsockname()[0],
-            self.new_predecessors_listener.socket.getsockname()[1])
+        my_addr = (
+            self.new_previous_hop_listener.socket.getsockname()[0],
+            self.new_previous_hop_listener.socket.getsockname()[1])
 
-        # Special case if we have only 2 nodes left
-        if self.predecessor[0] == self.next_hop_info[0]:
-            self.sending_queue.put(NewNextNextHop(self.predecessor, self_address))
-            self.next_next_hop_info = (self.new_predecessors_listener.socket.getsockname()[0],
-                                       self.new_predecessors_listener.socket.getsockname()[1])
-            logger.info('New next next hop3: {}'.format(self.next_next_hop_info))
+        # Now we have to make everyone update their next next hop
+        if self.previous_hop[0] == self.next_hop_info[0]:
+            # New ring - only us and new client
+            self.sending_queue.put(NewNextNextHop(self.previous_hop, my_addr))
+            self.next_next_hop_info = my_addr
+            logger.info('New next next hop: {}'.format(self.next_next_hop_info))
         else:
-            # We send information to predecessor of our predecessor about his new next next hop address
-            self.sending_queue.put(NewNextNextHop(self_address, self.predecessor))
-            # We send information to our predecessor about his new next next hop
-            self.sending_queue.put(NewNextNextHop(self.next_hop_info, self_address))
+            # This node is next next hop for the node who has its next hop set as our previous hop
+            self.sending_queue.put(NewNextNextHop(my_addr, self.previous_hop))
+            # Our next hop is next next hop for the node who has its next hop set as this node
+            self.sending_queue.put(NewNextNextHop(self.next_hop_info, my_addr))
 
     def handle_inner_drawing_event(self, event: InnerDrawingInformationEvent):
-        # points = event.data['points']
-        # print('INNER')
-        # color = event.data['color']
-        # self.paint_queue.put(PaintDrawing(points, color))
-        # for point in points:
-        #     try:
-        #         self.board_state[point[0]][point[1]] = color
-        #     except IndexError:
-        #         return
-        # if self.sending_queue:
-        #     self.sending_queue.put(
-        #         DrawingInformationEvent(self.uuid, NTP_timer.get_timestamp(), points, color))
-        def draw_points(event):
-            color = event.data['color']
-            points = event.data['points']
-            try:
-                for point in points:
-                  x,y = point
-                  self.board_state[x][y] = color
-            except IndexError as e:
-                print('inner drawing', e)
-                return
-
-            self.paint_queue.put(PaintDrawing(points, color))
-            if (self.sending_queue):
-                self.sending_queue.put(
-                    DrawingInformationEvent(self.uuid, NTP_timer.get_timestamp(), points, color))
-
         if not self.critical_section:
-            draw_points(event)
+            self.draw_pixels(event.data['points'], event.data['color'])
+            if self.sending_queue:
+                self.sending_queue.put(
+                    DrawingInformationEvent(self.uuid, NTP_timer.get_timestamp(), event.data['points'],
+                                            event.data['color']))
         elif self.critical_section['timestamp'] > event.data['timestamp']:
-            draw_points(event)
+            self.draw_pixels(event.data['points'], event.data['color'])
+            if self.sending_queue:
+                self.sending_queue.put(
+                    DrawingInformationEvent(self.uuid, NTP_timer.get_timestamp(), event.data['points'],
+                                            event.data['color']))
         elif self.critical_section['client_uuid'] == self.uuid:
-            draw_points(event)
-        elif self.critical_section['client_uuid'] != self.uuid:
-            pass
+            self.draw_pixels(event.data['points'], event.data['color'])
+            if self.sending_queue:
+                self.sending_queue.put(
+                    DrawingInformationEvent(self.uuid, NTP_timer.get_timestamp(), event.data['points'],
+                                            event.data['color']))
+
+    def draw_pixels(self, points, color):
+        try:
+            for point in points:
+                x, y = point
+                self.board_state[x][y] = color
+        except IndexError as e:
+            self.painting_queue.put(PaintBadBoardSize())
+            return
+        self.painting_queue.put(PaintDrawing(points, color))
 
     def handle_drawing_event(self, event: DrawingInformationEvent):
-        # data = event.data
-        # print('OUTER')
-        # if data['client_uuid'] != self.uuid:
-        #     points = data['points']
-        #     for point in points:
-        #         try:
-        #             self.board_state[point[0]][point[1]] = data['color']
-        #         except IndexError:
-        #             pass
-        #     self.paint_queue.put(PaintDrawing(points, data['color']))
-        #     if self.sending_queue:
-        #         self.sending_queue.put(event)
-        def draw_point(event):
-            points = event.data['points']
-            color = event.data['color']
-            try:
-                for point in points:
-                  x,y = point
-                  self.board_state[x][y] = color
-            except IndexError:
-                return
-
-            self.paint_queue.put(PaintDrawing(points, color))
-            if self.sending_queue:
-                self.sending_queue.put(event)
-
         if event.data['client_uuid'] == self.uuid:
             return
         if not self.critical_section:
-            draw_point(event)
+            self.draw_pixels(event.data['points'], event.data['color'])
+            if self.sending_queue:
+                self.sending_queue.put(event)
         elif self.critical_section['timestamp'] > event.data['timestamp']:
-            draw_point(event)
+            self.draw_pixels(event.data['points'], event.data['color'])
+            if self.sending_queue:
+                self.sending_queue.put(event)
         elif self.critical_section['client_uuid'] == event.data['client_uuid']:
-            draw_point(event)
-        elif self.critical_section['client_uuid'] != event.data['client_uuid']:
-            pass
+            self.draw_pixels(event.data['points'], event.data['color'])
+            if self.sending_queue:
+                self.sending_queue.put(event)
 
     def clean_old_state(self):
         self.next_hop_info = None
-        logger.info('New next hop6: {}'.format(self.next_hop_info))
+        logger.info('New next hop: {}'.format(self.next_hop_info))
         self.next_next_hop_info = None
-        logger.info('New next next hop4: {}'.format(self.next_next_hop_info))
-        self.predecessor = None
-        logger.info('Predecessor2: {}'.format(self.predecessor))
-
+        logger.info('New next next hop: {}'.format(self.next_next_hop_info))
+        self.previous_hop = None
+        logger.info('previous hop: {}'.format(self.previous_hop))
+        self.critical_section = None
         self.board_state = [[0 for _ in range(PAINT_WIDTH)] for _ in range(PAINT_HEIGHT)]
+        self.sending_queue = None
+        if self.message_sender:
+            self.message_sender.stop()
+        if self.previous_hop_listener:
+            self.previous_hop_listener.stop()
+        self.last_token = 0
+        self.painting_queue.put(PaintBoardOpen())
 
     def handle_token_pass(self, event: TokenPassEvent):
-        token = event.data['token'] + 1
-        self.last_token = token
+        # Firstly, increment last_token
+        self.last_token = event.data['token'] + 1
 
+        # Secondly, check if critical section was released
         if self.critical_section:
-            # If we have received the token and the critical section exists we unvalidate critical secion info
             self.critical_section = None
-            self.paint_queue.put(PaintBoardOpen())
+            self.painting_queue.put(PaintBoardOpen())
 
+        # Thirdly, check if we want to enter critical section
         if self.want_to_enter_critical_section:
+            # If yes, then hold token and send info about new board owner
+            self.want_to_enter_critical_section = False
             timestamp = NTP_timer.get_timestamp()
             self.critical_section = {
                 'timestamp': timestamp,
                 'client_uuid': self.uuid
             }
-            # TODO
-            leave_critical_section_deamon = CriticalSectionLeaver(self.main_queue)
-            leave_critical_section_deamon.start()
-            self.want_to_enter_critical_section = False
-            self.paint_queue.put(PaintBoardPossessed())
+            threading.Timer(_SECONDS_IN_CRITICAL_SECTION,
+                            lambda: self.main_queue.put(InnerLeavingCriticalSection())).start()
+            self.painting_queue.put(PaintBoardPossessed())
             self.sending_queue.put(EnteredCriticalSectionEvent(timestamp, self.uuid))
         else:
+            # If not, then simply pass token
             if self.sending_queue:
-                self.sending_queue.put(TokenPassEvent(token))
+                self.sending_queue.put(TokenPassEvent(self.last_token))
 
     def handle_token_receiver_question(self, event: TokenReceivedQuestionEvent):
-        # We check weather the last token we received is greater than
-        # the token from the request
-        # If it is, this means that the disconnected client was not in posession of the token when he disconnected
-        # If it was we have to unvalidate critial secion information and send token further
-
-        if self.last_token > event.data['token'] + 1:
+        # Check if our last known token is greater than token in the query (token from previous previous hop) + 1.
+        try:
+            token_event = event.data['token']
+        except (json.decoder.JSONDecodeError, KeyError):
+            return
+        if self.last_token > token_event + 1:
+            # If yes, then broken node exited the critical section and we do not have to create new token
             return
         else:
-            self.critical_section = None
-            self.paint_queue.put(PaintBoardOpen())
-            token = event.data['token'] + 1 if event.data['token'] else self.last_token + 1
+            # If not, then create new token and pass it (and exit critical section)
+            token = token_event + 1
             self.sending_queue.put(TokenPassEvent(token))
+            self.critical_section = None
+            self.painting_queue.put(PaintBoardOpen())
 
     def handle_entering_critical_section(self, event: EnteredCriticalSectionEvent):
-        data = event.data
-        if (data['client_uuid']) == self.uuid:
+        client_uuid = event.data['client_uuid']
+        timestamp = event.data['timestamp']
+        if client_uuid == self.uuid:
             return
         self.critical_section = {
-            'timestamp': data['timestamp'],
-            'client_uuid': data['client_uuid']
+            'timestamp': timestamp,
+            'client_uuid': client_uuid
         }
-        self.paint_queue.put(PaintBoardClosed())
+        self.painting_queue.put(PaintBoardClosed())
         self.sending_queue.put(event)
 
     def handle_inner_leave_critical_section(self, event: InnerLeavingCriticalSection):
         self.critical_section = None
-        self.paint_queue.put(PaintBoardOpen())
+        self.painting_queue.put(PaintBoardOpen())
         if self.sending_queue:
             self.sending_queue.put(LeavingCriticalSectionEvent(NTP_timer.get_timestamp(), self.uuid))
             self.sending_queue.put(TokenPassEvent(self.last_token))
@@ -427,86 +424,67 @@ class Model:
             self.main_queue.put(TokenPassEvent(self.last_token))
 
     def handle_leave_critical_section(self, event: LeavingCriticalSectionEvent):
-        data = event.data
-        if (data['client_uuid']) == self.uuid:
+        client_uuid = event.data['client_uuid']
+
+        if client_uuid == self.uuid:
+            # Message was received by everyone in the ring
             return
 
-        if self.critical_section and self.critical_section['client_uuid'] == event.data['client_uuid']:
-            self.paint_queue.put(PaintBoardOpen())
+        if self.critical_section and self.critical_section['client_uuid'] == client_uuid:
+            self.painting_queue.put(PaintBoardOpen())
             self.critical_section = None
 
         self.sending_queue.put(event)
 
     def handle_new_next_next_hop(self, event: NewNextNextHop):
-        post_destination_ip, _ = event.data['destination_next_hop']
-        next_hop_ip, _ = self.next_hop_info
+        destination_next_hop_ip, destination_next_hop_port = event.data['destination_next_hop']
 
-        # We are the recipient of the message
-        if post_destination_ip == next_hop_ip:
+        # Check if destination_next_hop ip address is our next hop ip address
+        if destination_next_hop_ip == self.next_hop_info[0]:
+            # If yes, then we are receiver of this message
             self.next_next_hop_info = event.data['new_address']
-            logger.info('New next next hop5: {}'.format(self.next_next_hop_info))
+            logger.info('New next next hop: {}'.format(self.next_next_hop_info))
         else:
             self.sending_queue.put(event)
 
-    def handle_dummy_message_event(self, event: DummyMessageEvent):
-        if self.sending_queue:
-            if self.uuid != event.data['uuid']:
-                return
-            else:
-                if self.sending_queue:
-                    self.sending_queue.put(event)
-
-    def handle_inner_next_hop_broken(self, event: InnerNextHopBroken):
-        # If we detect that the next hop connection is down we want to:
-        # 1.Try to reconnect to the client
-        # 2.If reconnect fails we want to connect to our next next hop
-        # 3.When we succesfully connect to our next next hop we want to send recovery token question
-        #   in case that the dead client was holding the token the moment he died
-
-        ip, port = self.next_next_hop_info
-        # If we are the only client left we reset the data to the initial state
-        if ip == utils.get_my_ip_address():
-            self.critical_section = None
-            self.next_hop_info = None
-            logger.info('New next hop2: {}'.format(self.next_hop_info))
-            self.next_next_hop_info = None
-            logger.info('New next next hop6: {}'.format(self.next_next_hop_info))
-            if self.message_sender:
-                self.message_sender.stop()
-            self.sending_queue = None
-            self.message_sender = None
-            self.predecessor = None
-            logger.info('Predecessor3: {}'.format(self.predecessor))
-            self.last_token = 0
-            self.paint_queue.put(PaintBoardOpen())
+    def handle_control_package_event(self, event: ControlPackageEvent):
+        if self.uuid != event.data['uuid']:
             return
 
-        def connect_to_next_next_hop(self):
-            ip, port = self.next_next_hop_info
+    def handle_inner_next_hop_broken(self, event: InnerNextHopBroken):
+        next_next_hop_ip, next_next_hop_port = self.next_next_hop_info
+        if next_next_hop_ip == utils.get_my_ip_address():
+            # If we are the only client left - clean old state
+            self.clean_old_state()
+            return
+
+        # Firstly, try to reconnect to next_hop
+        next_hop_ip, next_hop_port = self.next_hop_info
+        try:
+            next_hop_sock = socket.create_connection((next_hop_ip, next_hop_port))
+            self.sending_queue = queue.Queue()
+            self.message_sender = MessageSender(self.main_queue, self.sending_queue, next_hop_sock,
+                                                (next_hop_sock.getsockname()[0], next_hop_sock.getsockname()[1]))
+            self.message_sender.run()
+        except ConnectionRefusedError as e:
+            logger.error("Couldn't connect to next_hop: ", e)
+            next_next_hop_ip, next_next_hop_port = self.next_next_hop_info
             try:
-                s = socket.create_connection((ip, port))
+                next_next_hop_sock = socket.create_connection((next_next_hop_ip, next_next_hop_port))
                 self.sending_queue = queue.Queue()
-                self.message_sender = MessageSender(self.main_queue, self.sending_queue, s,
-                                                    (s.getsockname()[0], s.getsockname()[1]))
+                self.message_sender = MessageSender(self.main_queue, self.sending_queue, next_next_hop_sock,
+                                                    (next_next_hop_sock.getsockname()[0],
+                                                     next_next_hop_sock.getsockname()[1]))
                 self.message_sender.run()
                 self.next_hop_info = self.next_next_hop_info
-                logger.info('New next hop3: {}'.format(self.next_hop_info))
-                # After we connect to a new client we have to check whether the dead client wasn't in posession
-                # of token
+                logger.info('New next hop: {}'.format(self.next_hop_info))
                 self.sending_queue.put(TokenReceivedQuestionEvent(self.last_token))
             except Exception as e:
                 logger.error(e)
 
-        ip, port = self.next_hop_info
-        try:
-            s = socket.create_connection((ip, port))
-            self.sending_queue = queue.Queue(maxsize=0)
-            self.message_sender = MessageSender(self.main_queue, self.sending_queue, s,
-                                                (s.getsockname()[0], s.getsockname()[1]))
-            self.message_sender.run()
-        except ConnectionRefusedError as e:
-            logger.error(e)
-            connect_to_next_next_hop(self)
-
     def handle_inner_want_to_enter_critical_section(self, event: InnerWantToEnterCriticalSection):
         self.want_to_enter_critical_section = True
+
+    def handle_innder_control_package(self, event: InnerControlPackage):
+        if self.sending_queue:
+            self.sending_queue.put(ControlPackageEvent(self.uuid))
